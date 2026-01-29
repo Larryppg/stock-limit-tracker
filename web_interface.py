@@ -1,5 +1,6 @@
 """
 Web可视化接口 - 使用Streamlit构建简单UI
+支持增量数据加载（云端部署优化）
 """
 try:
     import streamlit as st
@@ -8,9 +9,34 @@ except ImportError:
     exit(1)
 
 import pandas as pd
+import os
 from datetime import datetime, timedelta
 import query_api
 import database
+
+
+# 缓存增量数据（避免每次页面刷新都重新加载）
+@st.cache_data(ttl=300)  # 5分钟缓存
+def load_increments_data():
+    """加载所有增量文件数据"""
+    try:
+        import increment_manager
+        
+        dates = increment_manager.list_increments()
+        if not dates:
+            return pd.DataFrame(), pd.DataFrame(), []
+        
+        market_data, limit_results = increment_manager.load_all_increments()
+        return market_data, limit_results, dates
+    except Exception as e:
+        st.warning(f"加载增量文件失败: {e}")
+        return pd.DataFrame(), pd.DataFrame(), []
+
+
+def get_combined_dates(db_dates: list, increment_dates: list) -> list:
+    """合并数据库日期和增量文件日期"""
+    all_dates = set(db_dates) | set(increment_dates)
+    return sorted(all_dates, reverse=True)
 
 
 def main():
@@ -30,49 +56,112 @@ def main():
             "选择功能",
             ["市场概览", "涨停/炸板明细", "高连板查询", "个股分析", "历史统计"]
         )
+        
+        # 显示数据源信息
+        st.markdown("---")
+        st.caption("📊 数据源状态")
     
     # 初始化API
     api = query_api.LimitQueryAPI()
     api.connect()
     
-    # 获取可用日期
+    # 加载增量数据
+    increment_market, increment_limits, increment_dates = load_increments_data()
+    
+    # 在侧边栏显示增量文件信息
+    with st.sidebar:
+        if increment_dates:
+            st.success(f"✓ 增量文件: {len(increment_dates)} 个")
+            st.caption(f"最新: {increment_dates[-1] if increment_dates else 'N/A'}")
+        else:
+            st.info("无增量文件")
+    
+    # 获取数据库可用日期
     conn = database.get_connection()
     dates_df = pd.read_sql_query(
-        "SELECT DISTINCT date FROM limit_analysis_result ORDER BY date DESC LIMIT 30",
+        "SELECT DISTINCT date FROM limit_analysis_result ORDER BY date DESC LIMIT 90",
         conn
     )
     conn.close()
     
-    if dates_df.empty:
+    db_dates = dates_df['date'].tolist() if not dates_df.empty else []
+    
+    # 合并日期
+    available_dates = get_combined_dates(db_dates, increment_dates)
+    
+    if not available_dates:
         st.warning("⚠️ 数据库中暂无数据，请先运行MVP流程生成数据")
         return
     
-    available_dates = dates_df['date'].tolist()
+    # 将增量数据传递给各页面
+    increment_data = {
+        'market': increment_market,
+        'limits': increment_limits,
+        'dates': increment_dates
+    }
     
     # 根据选择的页面显示不同内容
     if page == "市场概览":
-        show_market_overview(api, available_dates)
+        show_market_overview(api, available_dates, increment_data)
     elif page == "涨停/炸板明细":
-        show_daily_limit_details(api, available_dates)
+        show_daily_limit_details(api, available_dates, increment_data)
     elif page == "高连板查询":
-        show_high_chain_query(api, available_dates)
+        show_high_chain_query(api, available_dates, increment_data)
     elif page == "个股分析":
-        show_stock_analysis(api, available_dates)
+        show_stock_analysis(api, available_dates, increment_data)
     elif page == "历史统计":
-        show_historical_stats(api, available_dates)
+        show_historical_stats(api, available_dates, increment_data)
     
     api.close()
 
 
-def show_market_overview(api, available_dates):
+def get_data_for_date(api, selected_date: str, increment_data: dict, data_type: str = 'summary'):
+    """
+    获取指定日期的数据（优先从增量文件，否则从数据库）
+    
+    data_type: 'summary', 'limits', 'fried', 'high_chain'
+    """
+    # 检查是否在增量文件中
+    if selected_date in increment_data['dates']:
+        limits_df = increment_data['limits']
+        if not limits_df.empty:
+            day_data = limits_df[limits_df['date'].astype(str) == str(selected_date)]
+            if not day_data.empty:
+                return day_data, 'increment'
+    
+    # 从数据库获取
+    return None, 'database'
+
+
+def show_market_overview(api, available_dates, increment_data=None):
     """市场概览页面"""
     st.header("市场概览")
     
     # 日期选择
     selected_date = st.selectbox("选择日期", available_dates)
     
+    # 标记数据来源
+    is_from_increment = selected_date in (increment_data.get('dates', []) if increment_data else [])
+    if is_from_increment:
+        st.caption("📄 数据来源: 增量文件")
+    
     # 获取市场摘要
-    summary = api.query_daily_summary(selected_date)
+    # 如果是增量数据，手动计算摘要
+    if is_from_increment and increment_data:
+        limits_df = increment_data['limits']
+        day_data = limits_df[limits_df['date'].astype(str) == str(selected_date)]
+        
+        if not day_data.empty:
+            summary = {
+                'total_limit': int(day_data['limit_status'].sum()) if 'limit_status' in day_data.columns else 0,
+                'yizi_count': int((day_data['board_type'] == 'yizi').sum()) if 'board_type' in day_data.columns else 0,
+                'fried_count': int(day_data['is_fried'].sum()) if 'is_fried' in day_data.columns else 0,
+                'chain_distribution': day_data[day_data['limit_status'] == 1].groupby('chain_height').size().reset_index().values.tolist() if 'chain_height' in day_data.columns and 'limit_status' in day_data.columns else []
+            }
+        else:
+            summary = api.query_daily_summary(selected_date)
+    else:
+        summary = api.query_daily_summary(selected_date)
     
     # 显示关键指标
     col1, col2, col3, col4 = st.columns(4)
@@ -103,7 +192,7 @@ def show_market_overview(api, available_dates):
         st.info("当日无连板数据")
 
 
-def show_high_chain_query(api, available_dates):
+def show_high_chain_query(api, available_dates, increment_data=None):
     """高连板查询页面"""
     st.header("高连板股票查询")
     
@@ -114,8 +203,32 @@ def show_high_chain_query(api, available_dates):
     with col2:
         min_height = st.slider("最小连板高度", 1, 10, 2)
     
+    # 标记数据来源
+    is_from_increment = selected_date in (increment_data.get('dates', []) if increment_data else [])
+    if is_from_increment:
+        st.caption("📄 数据来源: 增量文件")
+    
     # 查询高连板股票
-    high_chain = api.query_high_chain_stocks(selected_date, min_height)
+    if is_from_increment and increment_data:
+        limits_df = increment_data['limits']
+        day_data = limits_df[limits_df['date'].astype(str) == str(selected_date)]
+        
+        if not day_data.empty and 'chain_height' in day_data.columns:
+            high_chain = day_data[
+                (day_data['limit_status'] == 1) & 
+                (day_data['chain_height'] >= min_height)
+            ].copy()
+            # 添加缺失的列（如果有的话）
+            if 'change_pct' not in high_chain.columns:
+                high_chain['change_pct'] = 0
+            if 'close' not in high_chain.columns:
+                high_chain['close'] = 0
+            if 'name' not in high_chain.columns:
+                high_chain['name'] = high_chain['code']
+        else:
+            high_chain = api.query_high_chain_stocks(selected_date, min_height)
+    else:
+        high_chain = api.query_high_chain_stocks(selected_date, min_height)
     
     if not high_chain.empty:
         st.success(f"找到 {len(high_chain)} 只股票")
@@ -152,15 +265,57 @@ def show_high_chain_query(api, available_dates):
         st.info(f"当日无 {min_height} 板及以上的股票")
 
 
-def show_daily_limit_details(api, available_dates):
+def show_daily_limit_details(api, available_dates, increment_data=None):
     """每日涨停/炸板明细页面"""
     st.header("每日涨停/炸板明细")
     
     # 日期选择
-    selected_date = st.selectbox("选择日期", available_dates)
+    selected_date = st.selectbox("选择日期", available_dates, key="detail_date")
+    
+    # 标记数据来源
+    is_from_increment = selected_date in (increment_data.get('dates', []) if increment_data else [])
+    if is_from_increment:
+        st.caption("📄 数据来源: 增量文件")
+    
+    # 获取数据
+    if is_from_increment and increment_data:
+        limits_df = increment_data['limits']
+        day_data = limits_df[limits_df['date'].astype(str) == str(selected_date)]
+        
+        if not day_data.empty:
+            # 计算摘要
+            summary = {
+                'total_limit': int(day_data['limit_status'].sum()) if 'limit_status' in day_data.columns else 0,
+                'chain_distribution': day_data[day_data['limit_status'] == 1].groupby('chain_height').size().reset_index().values.tolist() if 'chain_height' in day_data.columns else [],
+                'fried_count': int(day_data['is_fried'].sum()) if 'is_fried' in day_data.columns else 0
+            }
+            
+            # 涨停股
+            limit_df = day_data[day_data['limit_status'] == 1].copy() if 'limit_status' in day_data.columns else pd.DataFrame()
+            # 炸板股
+            fried_df = day_data[day_data['is_fried'] == 1].copy() if 'is_fried' in day_data.columns else pd.DataFrame()
+            
+            # 添加缺失列
+            for df in [limit_df, fried_df]:
+                if not df.empty:
+                    if 'name' not in df.columns:
+                        df['name'] = df['code']
+                    if 'change_pct' not in df.columns:
+                        df['change_pct'] = 0
+                    if 'close' not in df.columns:
+                        df['close'] = 0
+                    if 'volume' not in df.columns:
+                        df['volume'] = 0
+        else:
+            summary = api.query_daily_summary(selected_date)
+            limit_df = api.query_daily_limit_stocks(selected_date)
+            fried_df = api.query_daily_fried_stocks(selected_date)
+    else:
+        summary = api.query_daily_summary(selected_date)
+        limit_df = api.query_daily_limit_stocks(selected_date)
+        fried_df = api.query_daily_fried_stocks(selected_date)
     
     # 摘要指标
-    summary = api.query_daily_summary(selected_date)
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("涨停总数", summary['total_limit'])
@@ -168,10 +323,6 @@ def show_daily_limit_details(api, available_dates):
         st.metric("连板分布", f"{len(summary['chain_distribution'])}档")
     with col3:
         st.metric("炸板数", summary['fried_count'])
-    
-    # 查询明细
-    limit_df = api.query_daily_limit_stocks(selected_date)
-    fried_df = api.query_daily_fried_stocks(selected_date)
     
     tab1, tab2 = st.tabs(["涨停股", "炸板股"])
     
@@ -210,7 +361,7 @@ def show_daily_limit_details(api, available_dates):
             st.info("当日无炸板股票")
 
 
-def show_stock_analysis(api, available_dates):
+def show_stock_analysis(api, available_dates, increment_data=None):
     """个股分析页面"""
     st.header("个股连板分析")
     
@@ -280,7 +431,7 @@ def show_stock_analysis(api, available_dates):
             st.warning("未找到匹配的股票")
 
 
-def show_historical_stats(api, available_dates):
+def show_historical_stats(api, available_dates, increment_data=None):
     """历史统计页面"""
     st.header("历史统计分析")
     
